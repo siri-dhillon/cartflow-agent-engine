@@ -1,0 +1,9 @@
+google-genai
+mcp
+httpx
+streamlit
+python-dotenv
+pydantic
+pydantic-settings
+pytest
+requests
