@@ -39,6 +39,7 @@ Core Operating Instructions:
 class CartFlowAgent:
     """
     Autonomous, margin-aware checkout agent core using google-genai SDK (gemini-1.5-flash).
+    Supports both Vertex AI (ADC authentication for Qwiklabs/GCP) and Google AI Studio API keys.
     """
 
     def __init__(
@@ -46,17 +47,35 @@ class CartFlowAgent:
         api_key: Optional[str] = None,
         model_name: str = "gemini-1.5-flash",
         use_mocks: Optional[bool] = None,
+        project_id: Optional[str] = None,
+        location: Optional[str] = None,
     ):
-        self.api_key = api_key or settings.GEMINI_API_KEY
+        self.api_key = api_key or getattr(settings, "GEMINI_API_KEY", None)
         self.model_name = model_name
-        self.use_mocks = use_mocks if use_mocks is not None else settings.USE_MOCKS
+        self.use_mocks = use_mocks if use_mocks is not None else getattr(settings, "USE_MOCKS", False)
+        self.project_id = project_id or os.getenv("GOOGLE_CLOUD_PROJECT", "qwiklabs-gcp-04-f50badd76af6")
+        self.location = location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         self.client = None
 
-        if GENAI_AVAILABLE and self.api_key and not self.use_mocks:
-            try:
-                self.client = genai.Client(api_key=self.api_key)
-            except Exception:
-                self.client = None
+        if GENAI_AVAILABLE and not self.use_mocks:
+            # 1. Try Vertex AI with Application Default Credentials (ADC)
+            use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "true").lower() in ("true", "1", "yes")
+            if use_vertex or not self.api_key:
+                try:
+                    self.client = genai.Client(
+                        vertexai=True,
+                        project=self.project_id,
+                        location=self.location,
+                    )
+                except Exception as e:
+                    self.client = None
+
+            # 2. Fall back to AI Studio API key if provided and Vertex AI didn't initialize
+            if not self.client and self.api_key:
+                try:
+                    self.client = genai.Client(api_key=self.api_key)
+                except Exception:
+                    self.client = None
 
     async def process_message(
         self,
@@ -68,7 +87,6 @@ class CartFlowAgent:
         Process an incoming user message through the function call loop, capture telemetry into
         telemetry_sink, and return the final assistant message string.
         """
-        # If real GenAI SDK client is available and not in forced mock mode, execute official GenAI loop
         if self.client and not self.use_mocks:
             try:
                 return await self._process_genai_loop(user_id, message, telemetry_sink)
@@ -118,7 +136,10 @@ class CartFlowAgent:
                 tool_fn = TOOL_FUNCTIONS.get(func_name)
                 
                 if tool_fn:
-                    result = tool_fn(**func_args)
+                    if asyncio.iscoroutinefunction(tool_fn):
+                        result = await tool_fn(**func_args)
+                    else:
+                        result = tool_fn(**func_args)
                 else:
                     result = {"error": f"Tool '{func_name}' not defined."}
 
@@ -162,7 +183,7 @@ class CartFlowAgent:
         msg_lower = message.lower()
         is_discount_request = any(
             kw in msg_lower
-            for kw in ["discount", "deal", "expensive", "cheaper", "coupon", "price", "too high", "hesitate", "cost", "lower"]
+            for kw in ["discount", "deal", "expensive", "cheaper", "coupon", "price", "too high", "hesitate", "cost", "lower", "budget"]
         )
         is_buy_request = any(
             kw in msg_lower
@@ -172,7 +193,12 @@ class CartFlowAgent:
         # 1. Always search Loomi catalog
         cat_start = time.time()
         search_query = message if len(message) < 30 else "running shoes"
-        catalog_results = search_catalog_loomi(query=search_query)
+        
+        if asyncio.iscoroutinefunction(search_catalog_loomi):
+            catalog_results = await search_catalog_loomi(query=search_query)
+        else:
+            catalog_results = search_catalog_loomi(query=search_query)
+
         telemetry_sink.append({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "event": "tool_execution",
@@ -182,7 +208,7 @@ class CartFlowAgent:
             "duration_ms": round((time.time() - cat_start) * 1000, 2),
         })
 
-        product = catalog_results[0] if catalog_results else {
+        product = catalog_results[0] if (catalog_results and isinstance(catalog_results, list)) else {
             "variant_id": "gid://shopify/ProductVariant/401122334455",
             "title": "Aura Flow Eco Smart Running Shoes",
             "price": 129.99
@@ -232,14 +258,14 @@ class CartFlowAgent:
             return (
                 f"I've found the **{product.get('title')}** for you!\n\n"
                 f"As a valued **{tier}** member, you qualify for an authorized **{int(max_discount_pct)}% discount**.\n"
-                f"• Subtotal: ${checkout_res.get('subtotal'):.2f}\n"
-                f"• Discounted Total: **${checkout_res.get('final_price'):.2f}** (Code applied: `{discount_code}`)\n\n"
+                f"• Subtotal: ${checkout_res.get('subtotal', 129.99):.2f}\n"
+                f"• Discounted Total: **${checkout_res.get('final_price', 110.49):.2f}** (Code applied: `{discount_code}`)\n\n"
                 f"Here is your 1-click checkout link: [Complete Checkout]({checkout_res.get('checkout_url')})"
             )
 
         return (
             f"Here is what I found in our Bloomreach Loomi catalog:\n\n"
-            f"**{product.get('title')}** - ${product.get('price'):.2f}\n"
+            f"**{product.get('title')}** - ${product.get('price', 129.99):.2f}\n"
             f"{product.get('description', '')}\n\n"
             f"Let me know if you would like me to check your account for eligible discounts and generate a checkout link!"
         )
