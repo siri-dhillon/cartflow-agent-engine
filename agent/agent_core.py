@@ -45,13 +45,13 @@ class CartFlowAgent:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model_name: str = "gemini-1.5-flash",
+        model_name: Optional[str] = None,
         use_mocks: Optional[bool] = None,
         project_id: Optional[str] = None,
         location: Optional[str] = None,
     ):
         self.api_key = api_key or getattr(settings, "GEMINI_API_KEY", None)
-        self.model_name = model_name
+        self.model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         self.use_mocks = use_mocks if use_mocks is not None else getattr(settings, "USE_MOCKS", False)
         self.project_id = project_id or os.getenv("GOOGLE_CLOUD_PROJECT", "qwiklabs-gcp-04-f50badd76af6")
         self.location = location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")

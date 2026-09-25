@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "checkout_agents"
+version = "0.1.0"
+description = "Multi-agent e-commerce checkout engine driven by Google GenAI SDK, A2A Protocol, and MCP servers"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "google-genai>=2.25.0",
+    "mcp>=1.9.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "uvicorn>=0.30.0",
+    "fastapi>=0.110.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --import-mode=importlib"
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
