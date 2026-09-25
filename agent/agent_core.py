@@ -27,19 +27,19 @@ except ImportError:
 
 SYSTEM_PROMPT = """You are CartFlow Agent, an autonomous, margin-aware checkout assistant for an e-commerce platform.
 
-Core Operating Instructions:
+Operating Directives:
 1. Always query Bloomreach Loomi MCP using `search_catalog_loomi` for product inquiries or catalog recommendations.
 2. When a user exhibits price resistance, hesitates on cost, or requests a discount, query Databricks using `get_customer_profile` to fetch their loyalty tier and allowable discount margin (`max_authorized_discount_pct`).
 3. NEVER offer or apply a discount higher than the customer's `max_authorized_discount_pct`.
-4. Execute `create_discounted_checkout` to generate a 1-click checkout URL, apply the dynamic discount code, and log the completed intent back into Databricks to close the feedback loop on customer LTV.
+4. Execute `create_discounted_checkout` to generate a 1-click checkout URL, apply the dynamic discount code, and log the completed intent.
 5. Deliver a concise, persuasive response containing the 1-click checkout URL.
 """
 
 
 class CartFlowAgent:
     """
-    Autonomous, margin-aware checkout agent core using google-genai SDK (gemini-1.5-flash).
-    Supports both Vertex AI (ADC authentication for Qwiklabs/GCP) and Google AI Studio API keys.
+    Autonomous, margin-aware checkout agent core using google-genai SDK.
+    Prioritizes Vertex AI Application Default Credentials (ADC).
     """
 
     def __init__(
@@ -67,10 +67,10 @@ class CartFlowAgent:
                         project=self.project_id,
                         location=self.location,
                     )
-                except Exception as e:
+                except Exception:
                     self.client = None
 
-            # 2. Fall back to AI Studio API key if provided and Vertex AI didn't initialize
+            # 2. Fall back to AI Studio API key if Vertex AI failed to initialize
             if not self.client and self.api_key:
                 try:
                     self.client = genai.Client(api_key=self.api_key)
@@ -84,8 +84,8 @@ class CartFlowAgent:
         telemetry_sink: list
     ) -> str:
         """
-        Process an incoming user message through the function call loop, capture telemetry into
-        telemetry_sink, and return the final assistant message string.
+        Process an incoming message through the function call loop, capture telemetry into
+        telemetry_sink, and return the final response string.
         """
         if self.client and not self.use_mocks:
             try:
@@ -97,7 +97,7 @@ class CartFlowAgent:
                     "reason": str(e),
                 })
 
-        # Fallback / mock agent reasoning loop for offline testing & mock mode
+        # Deterministic mock/fallback loop
         return await self._process_mock_loop(user_id, message, telemetry_sink)
 
     async def _process_genai_loop(
@@ -106,7 +106,7 @@ class CartFlowAgent:
         message: str,
         telemetry_sink: list
     ) -> str:
-        """Execute agent tool-calling loop using official google-genai SDK."""
+        """Execute agent tool-calling loop using Google GenAI SDK over Vertex AI ADC."""
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             tools=GEMINI_TOOLS,
@@ -128,24 +128,27 @@ class CartFlowAgent:
                 func_name = call.name
                 func_args = dict(call.args) if call.args else {}
 
-                # Guarantee user_id parameter for tools that require it
+                # Guarantee user_id parameter for user-specific tools
                 if func_name in ("get_customer_profile", "create_discounted_checkout") and "user_id" not in func_args:
                     func_args["user_id"] = user_id
 
                 tool_start_time = time.time()
                 tool_fn = TOOL_FUNCTIONS.get(func_name)
-                
+
                 if tool_fn:
-                    if asyncio.iscoroutinefunction(tool_fn):
-                        result = await tool_fn(**func_args)
-                    else:
-                        result = tool_fn(**func_args)
+                    try:
+                        if asyncio.iscoroutinefunction(tool_fn):
+                            result = await tool_fn(**func_args)
+                        else:
+                            result = tool_fn(**func_args)
+                    except Exception as exc:
+                        result = {"error": f"Tool execution failed: {str(exc)}"}
                 else:
-                    result = {"error": f"Tool '{func_name}' not defined."}
+                    result = {"error": f"Tool '{func_name}' not defined in TOOL_FUNCTIONS."}
 
                 duration_ms = round((time.time() - tool_start_time) * 1000, 2)
 
-                # Capture execution telemetry
+                # Capture telemetry audit
                 telemetry_sink.append({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "event": "tool_execution",
@@ -162,7 +165,7 @@ class CartFlowAgent:
                     )
                 )
 
-            # Pass tool outputs back to Gemini model
+            # Pass tool execution outputs back to the Gemini model
             response = chat.send_message(function_responses)
 
         return response.text or "I have processed your request."
@@ -173,13 +176,7 @@ class CartFlowAgent:
         message: str,
         telemetry_sink: list
     ) -> str:
-        """
-        Mock agent reasoning loop enforcing system prompt directives:
-        1. Query Loomi MCP catalog.
-        2. Query Databricks for allowable discount margin on price resistance.
-        3. Never offer a discount higher than max_authorized_discount_pct.
-        4. Execute create_discounted_checkout to generate 1-click checkout & log to Databricks.
-        """
+        """Deterministic agent loop when offline or running in mock mode."""
         msg_lower = message.lower()
         is_discount_request = any(
             kw in msg_lower
@@ -190,14 +187,17 @@ class CartFlowAgent:
             for kw in ["buy", "checkout", "cart", "order", "purchase", "get", "link"]
         )
 
-        # 1. Always search Loomi catalog
+        # 1. Query Loomi MCP Catalog
         cat_start = time.time()
-        search_query = message if len(message) < 30 else "running shoes"
-        
-        if asyncio.iscoroutinefunction(search_catalog_loomi):
-            catalog_results = await search_catalog_loomi(query=search_query)
-        else:
-            catalog_results = search_catalog_loomi(query=search_query)
+        search_query = message if len(message) < 40 else "running shoes"
+
+        try:
+            if asyncio.iscoroutinefunction(search_catalog_loomi):
+                catalog_results = await search_catalog_loomi(query=search_query)
+            else:
+                catalog_results = search_catalog_loomi(query=search_query)
+        except Exception as e:
+            catalog_results = [{"title": search_query, "price": 49.99, "variant_id": "gid://shopify/ProductVariant/401122334455", "description": str(e)}]
 
         telemetry_sink.append({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -208,17 +208,37 @@ class CartFlowAgent:
             "duration_ms": round((time.time() - cat_start) * 1000, 2),
         })
 
-        product = catalog_results[0] if (catalog_results and isinstance(catalog_results, list)) else {
+        # Extract product details using Loomi schema
+        product = {
             "variant_id": "gid://shopify/ProductVariant/401122334455",
-            "title": "Aura Flow Eco Smart Running Shoes",
-            "price": 129.99
+            "title": "Catalog Product",
+            "price": 49.99,
+            "description": "High performance catalog selection."
         }
 
-        # 2. Query Databricks customer profile on price hesitation or buy request
+        if isinstance(catalog_results, list) and len(catalog_results) > 0:
+            item = catalog_results[0]
+            if isinstance(item, dict):
+                item_data = item.get("data", {}) if isinstance(item.get("data"), dict) else {}
+                product["title"] = (
+                    item.get("title")
+                    or item_data.get("title")
+                    or item_data.get("name")
+                    or product["title"]
+                )
+                product["price"] = float(item.get("price") or item.get("_parsedPrice") or item_data.get("price") or product["price"])
+                product["variant_id"] = str(item.get("variant_id") or item.get("itemId") or product["variant_id"])
+                product["description"] = item.get("description") or item_data.get("description") or product["description"]
+
+        # 2. Query Databricks customer profile on price hesitation or buy intent
         customer_profile = None
         if is_discount_request or is_buy_request:
             db_start = time.time()
-            customer_profile = get_customer_profile(user_id)
+            if asyncio.iscoroutinefunction(get_customer_profile):
+                customer_profile = await get_customer_profile(user_id)
+            else:
+                customer_profile = get_customer_profile(user_id)
+
             telemetry_sink.append({
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "event": "tool_execution",
@@ -228,44 +248,44 @@ class CartFlowAgent:
                 "duration_ms": round((time.time() - db_start) * 1000, 2),
             })
 
-        # 3 & 4. Enforce discount cap & create discounted checkout
+        # 3 & 4. Enforce margin cap & generate 1-click checkout
         if customer_profile and (is_discount_request or is_buy_request):
-            max_discount_pct = float(customer_profile.get("max_authorized_discount_pct", 15))
+            max_discount_pct = float(customer_profile.get("max_authorized_discount_pct", 15.0))
             tier = customer_profile.get("loyalty_tier", "Gold")
             discount_code = f"{tier.upper()}{int(max_discount_pct)}"
 
             chk_start = time.time()
-            checkout_res = create_discounted_checkout(
-                user_id=user_id,
-                variant_id=product.get("variant_id"),
-                discount_code=discount_code,
-                discount_pct=max_discount_pct
-            )
+            chk_kwargs = {
+                "user_id": user_id,
+                "variant_id": product.get("variant_id"),
+                "discount_code": discount_code,
+                "discount_pct": max_discount_pct
+            }
+            if asyncio.iscoroutinefunction(create_discounted_checkout):
+                checkout_res = await create_discounted_checkout(**chk_kwargs)
+            else:
+                checkout_res = create_discounted_checkout(**chk_kwargs)
+
             telemetry_sink.append({
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "event": "tool_execution",
                 "tool": "create_discounted_checkout",
-                "arguments": {
-                    "user_id": user_id,
-                    "variant_id": product.get("variant_id"),
-                    "discount_code": discount_code,
-                    "discount_pct": max_discount_pct
-                },
+                "arguments": chk_kwargs,
                 "result": checkout_res,
                 "duration_ms": round((time.time() - chk_start) * 1000, 2),
             })
 
             return (
-                f"I've found the **{product.get('title')}** for you!\n\n"
-                f"As a valued **{tier}** member, you qualify for an authorized **{int(max_discount_pct)}% discount**.\n"
-                f"• Subtotal: ${checkout_res.get('subtotal', 129.99):.2f}\n"
-                f"• Discounted Total: **${checkout_res.get('final_price', 110.49):.2f}** (Code applied: `{discount_code}`)\n\n"
-                f"Here is your 1-click checkout link: [Complete Checkout]({checkout_res.get('checkout_url')})"
+                f"I found the **{product.get('title')}** for you!\n\n"
+                f"As a valued **{tier}** member, I've applied an authorized **{int(max_discount_pct)}% discount**:\n"
+                f"• Subtotal: ${product.get('price'):.2f}\n"
+                f"• Discounted Total: **${checkout_res.get('final_price'):.2f}** (Code: `{discount_code}`)\n\n"
+                f"Complete your order here: [1-Click Checkout]({checkout_res.get('checkout_url')})"
             )
 
         return (
             f"Here is what I found in our Bloomreach Loomi catalog:\n\n"
-            f"**{product.get('title')}** - ${product.get('price', 129.99):.2f}\n"
-            f"{product.get('description', '')}\n\n"
-            f"Let me know if you would like me to check your account for eligible discounts and generate a checkout link!"
+            f"**{product.get('title')}** — ${product.get('price'):.2f}\n"
+            f"{product.get('description')}\n\n"
+            f"Would you like me to check your account for eligible discounts and generate a checkout link?"
         )
